@@ -67,9 +67,9 @@ simple_stmts[asdl_stmt_seq*]:
 simple_stmt[stmt_ty] (memo):
     | assignment
     | e=star_expressions { _PyAST_Expr(e, EXTRA) }
-    | &'return' return_stmt
-    | &('import' | 'from') import_stmt
-    | &'raise' raise_stmt
+    | &('return' | 'moan') return_stmt
+    | &('import'| 'from' | 'use') import_stmt
+    | &('scream' | 'raise') raise_stmt
     | 'pass' { _PyAST_Pass(EXTRA) }
     | &'del' del_stmt
     | &'yield' yield_stmt
@@ -135,12 +135,12 @@ del_stmt[stmt_ty]:
     | invalid_del_stmt
 
 import_stmt[stmt_ty]: import_name | import_from
-import_name[stmt_ty]: 'import' a=dotted_as_names { _PyAST_Import(a, EXTRA) }
+import_name[stmt_ty]: ('import' | 'use') a=dotted_as_names { _PyAST_Import(a, EXTRA) }
 # note below: the ('.' | '...') is necessary because '...' is tokenized as ELLIPSIS
 import_from[stmt_ty]:
-    | 'from' a=('.' | '...')* b=dotted_name 'import' c=import_from_targets {
+    | 'from' a=('.' | '...')* b=dotted_name ('import' | 'use') c=import_from_targets {
         _PyAST_ImportFrom(b->v.Name.id, c, _PyPegen_seq_count_dots(a), EXTRA) }
-    | 'from' a=('.' | '...')+ 'import' b=import_from_targets {
+    | 'from' a=('.' | '...')+ ('import' | 'use') b=import_from_targets {
         _PyAST_ImportFrom(NULL, b, _PyPegen_seq_count_dots(a), EXTRA) }
 import_from_targets[asdl_alias_seq*]:
     | '(' a=import_from_as_names [','] ')' { a }
@@ -387,11 +387,11 @@ keyword_pattern[KeyPatternPair*]:
     | arg=NAME '=' value=pattern { _PyPegen_key_pattern_pair(p, arg, value) }
 
 return_stmt[stmt_ty]:
-    | 'return' a=[star_expressions] { _PyAST_Return(a, EXTRA) }
+    | ('return' | 'moan') a=[star_expressions] { _PyAST_Return(a, EXTRA) }
 
 raise_stmt[stmt_ty]:
-    | 'raise' a=expression b=['from' z=expression { z }] { _PyAST_Raise(a, b, EXTRA) }
-    | 'raise' { _PyAST_Raise(NULL, NULL, EXTRA) }
+    | ('scream' | 'raise') a=expression b=['from' z=expression { z }] { _PyAST_Raise(a, b, EXTRA) }
+    | ('scream' | 'raise') { _PyAST_Raise(NULL, NULL, EXTRA) }
 
 function_def[stmt_ty]:
     | d=decorators f=function_def_raw { _PyPegen_function_def_decorators(p, d, f) }
