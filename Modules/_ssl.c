@@ -152,15 +152,27 @@ extern const SSL_METHOD *TLSv1_2_method(void);
   #ifndef PY_SSL_DEFAULT_CIPHER_STRING
      #error "Py_SSL_DEFAULT_CIPHERS 0 needs Py_SSL_DEFAULT_CIPHER_STRING"
   #endif
+  #ifndef PY_SSL_MIN_PROTOCOL
+    #define PY_SSL_MIN_PROTOCOL TLS1_2_VERSION
+  #endif
 #elif PY_SSL_DEFAULT_CIPHERS == 1
 /* Python custom selection of sensible cipher suites
- * DEFAULT: OpenSSL's default cipher list. Since 1.0.2 the list is in sensible order.
+ * @SECLEVEL=2: security level 2 with 112 bits minimum security (e.g. 2048 bits RSA key)
+ * ECDH+*: enable ephemeral elliptic curve Diffie-Hellman
+ * DHE+*: fallback to ephemeral finite field Diffie-Hellman
+ * encryption order: AES AEAD (GCM), ChaCha AEAD, AES CBC
  * !aNULL:!eNULL: really no NULL ciphers
- * !MD5:!3DES:!DES:!RC4:!IDEA:!SEED: no weak or broken algorithms on old OpenSSL versions.
  * !aDSS: no authentication with discrete logarithm DSA algorithm
- * !SRP:!PSK: no secure remote password or pre-shared key authentication
+ * !SHA1: no weak SHA1 MAC
+ * !AESCCM: no CCM mode, it's uncommon and slow
+ *
+ * Based on Hynek's excellent blog post (update 2021-02-11)
+ * https://hynek.me/articles/hardening-your-web-servers-ssl-ciphers/
  */
-  #define PY_SSL_DEFAULT_CIPHER_STRING "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK"
+  #define PY_SSL_DEFAULT_CIPHER_STRING "@SECLEVEL=2:ECDH+AESGCM:ECDH+CHACHA20:ECDH+AES:DHE+AES:!aNULL:!eNULL:!aDSS:!SHA1:!AESCCM"
+  #ifndef PY_SSL_MIN_PROTOCOL
+    #define PY_SSL_MIN_PROTOCOL TLS1_2_VERSION
+  #endif
 #elif PY_SSL_DEFAULT_CIPHERS == 2
 /* Ignored in SSLContext constructor, only used to as _ssl.DEFAULT_CIPHER_STRING */
   #define PY_SSL_DEFAULT_CIPHER_STRING SSL_DEFAULT_CIPHER_LIST
@@ -422,11 +434,10 @@ static PyType_Slot sslerror_type_slots[] = {
 };
 
 static PyType_Spec sslerror_type_spec = {
-    "ssl.SSLError",
-    sizeof(PyOSErrorObject),
-    0,
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    sslerror_type_slots
+    .name = "ssl.SSLError",
+    .basicsize = sizeof(PyOSErrorObject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = sslerror_type_slots
 };
 
 static void
@@ -777,7 +788,8 @@ newPySSLSocket(PySSLContext *sslctx, PySocketSockObject *sock,
     SSL_CTX *ctx = sslctx->ctx;
     _PySSLError err = { 0 };
 
-    self = PyObject_New(PySSLSocket, get_state_ctx(sslctx)->PySSLSocket_Type);
+    self = PyObject_GC_New(PySSLSocket,
+                           get_state_ctx(sslctx)->PySSLSocket_Type);
     if (self == NULL)
         return NULL;
 
@@ -884,6 +896,8 @@ newPySSLSocket(PySSLContext *sslctx, PySocketSockObject *sock,
             return NULL;
         }
     }
+
+    PyObject_GC_Track(self);
     return self;
 }
 
@@ -2157,6 +2171,7 @@ PySSL_traverse(PySSLSocket *self, visitproc visit, void *arg)
     Py_VISIT(self->exc_type);
     Py_VISIT(self->exc_value);
     Py_VISIT(self->exc_tb);
+    Py_VISIT(Py_TYPE(self));
     return 0;
 }
 
@@ -2173,13 +2188,15 @@ static void
 PySSL_dealloc(PySSLSocket *self)
 {
     PyTypeObject *tp = Py_TYPE(self);
-    if (self->ssl)
+    PyObject_GC_UnTrack(self);
+    if (self->ssl) {
         SSL_free(self->ssl);
+    }
     Py_XDECREF(self->Socket);
     Py_XDECREF(self->ctx);
     Py_XDECREF(self->server_hostname);
     Py_XDECREF(self->owner);
-    PyObject_Free(self);
+    PyObject_GC_Del(self);
     Py_DECREF(tp);
 }
 
@@ -2891,11 +2908,11 @@ static PyType_Slot PySSLSocket_slots[] = {
 };
 
 static PyType_Spec PySSLSocket_spec = {
-    "_ssl._SSLSocket",
-    sizeof(PySSLSocket),
-    0,
-    Py_TPFLAGS_DEFAULT,
-    PySSLSocket_slots,
+    .name = "_ssl._SSLSocket",
+    .basicsize = sizeof(PySSLSocket),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE |
+              Py_TPFLAGS_HAVE_GC),
+    .slots = PySSLSocket_slots,
 };
 
 /*
@@ -3095,8 +3112,25 @@ _ssl__SSLContext_impl(PyTypeObject *type, int proto_version)
         ERR_clear_error();
         PyErr_SetString(get_state_ctx(self)->PySSLErrorObject,
                         "No cipher can be selected.");
-        return NULL;
+        goto error;
     }
+#ifdef PY_SSL_MIN_PROTOCOL
+    switch(proto_version) {
+    case PY_SSL_VERSION_TLS:
+    case PY_SSL_VERSION_TLS_CLIENT:
+    case PY_SSL_VERSION_TLS_SERVER:
+        result = SSL_CTX_set_min_proto_version(ctx, PY_SSL_MIN_PROTOCOL);
+        if (result == 0) {
+            PyErr_Format(PyExc_ValueError,
+                         "Failed to set minimum protocol 0x%x",
+                          PY_SSL_MIN_PROTOCOL);
+            goto error;
+        }
+        break;
+    default:
+        break;
+    }
+#endif
 
     /* Set SSL_MODE_RELEASE_BUFFERS. This potentially greatly reduces memory
        usage for no cost at all. */
@@ -3119,6 +3153,10 @@ _ssl__SSLContext_impl(PyTypeObject *type, int proto_version)
 #endif
 
     return (PyObject *)self;
+  error:
+    Py_XDECREF(self);
+    ERR_clear_error();
+    return NULL;
 }
 
 static int
@@ -3126,6 +3164,7 @@ context_traverse(PySSLContext *self, visitproc visit, void *arg)
 {
     Py_VISIT(self->set_sni_cb);
     Py_VISIT(self->msg_cb);
+    Py_VISIT(Py_TYPE(self));
     return 0;
 }
 
@@ -4608,11 +4647,11 @@ static PyType_Slot PySSLContext_slots[] = {
 };
 
 static PyType_Spec PySSLContext_spec = {
-    "_ssl._SSLContext",
-    sizeof(PySSLContext),
-    0,
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
-    PySSLContext_slots,
+    .name = "_ssl._SSLContext",
+    .basicsize = sizeof(PySSLContext),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC |
+              Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = PySSLContext_slots,
 };
 
 
@@ -4656,10 +4695,18 @@ _ssl_MemoryBIO_impl(PyTypeObject *type)
     return (PyObject *) self;
 }
 
+static int
+memory_bio_traverse(PySSLMemoryBIO *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    return 0;
+}
+
 static void
 memory_bio_dealloc(PySSLMemoryBIO *self)
 {
     PyTypeObject *tp = Py_TYPE(self);
+    PyObject_GC_UnTrack(self);
     BIO_free(self->bio);
     Py_TYPE(self)->tp_free(self);
     Py_DECREF(tp);
@@ -4810,15 +4857,16 @@ static PyType_Slot PySSLMemoryBIO_slots[] = {
     {Py_tp_getset, memory_bio_getsetlist},
     {Py_tp_new, _ssl_MemoryBIO},
     {Py_tp_dealloc, memory_bio_dealloc},
+    {Py_tp_traverse, memory_bio_traverse},
     {0, 0},
 };
 
 static PyType_Spec PySSLMemoryBIO_spec = {
-    "_ssl.MemoryBIO",
-    sizeof(PySSLMemoryBIO),
-    0,
-    Py_TPFLAGS_DEFAULT,
-    PySSLMemoryBIO_slots,
+    .name = "_ssl.MemoryBIO",
+    .basicsize = sizeof(PySSLMemoryBIO),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE |
+              Py_TPFLAGS_HAVE_GC),
+    .slots = PySSLMemoryBIO_slots,
 };
 
 /*
@@ -4901,6 +4949,7 @@ static int
 PySSLSession_traverse(PySSLSession *self, visitproc visit, void *arg)
 {
     Py_VISIT(self->ctx);
+    Py_VISIT(Py_TYPE(self));
     return 0;
 }
 
@@ -4989,11 +5038,11 @@ static PyType_Slot PySSLSession_slots[] = {
 };
 
 static PyType_Spec PySSLSession_spec = {
-    "_ssl.SSLSession",
-    sizeof(PySSLSession),
-    0,
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    PySSLSession_slots,
+    .name = "_ssl.SSLSession",
+    .basicsize = sizeof(PySSLSession),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
+              Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = PySSLSession_slots,
 };
 
 
